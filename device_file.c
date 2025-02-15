@@ -11,17 +11,24 @@
 #include <linux/gpio.h>
 #include <linux/types.h>
 #include <linux/i2c.h>
-
 #include <linux/workqueue.h>
+#include <linux/gpio/consumer.h>
 
 //Mount char device with: sudo mknod /dev/encoder-driver c 240 0
 //You can change these if you want different pins.
 //Be careful which ones you use..  they don't always work
 //sometimes different Interrupt channels conflict.
+//Update 2/14/2025 - Allegadly, all RPi pins are valid for interrupts,
+//so all pins can be used.  
+
 
 #define QUADRATURE 1
 #define NUM_ENCODERS 2
 
+// Need this because the GPIO numbers are different in the kernel
+// CAUTION - this might be different on different RPi versions. 
+// This was tested on RPi 4B
+#define PIN_OFFSET 512
 #if QUADRATURE
 #define PIN_1A 17
 #define PIN_1B 27
@@ -64,23 +71,19 @@ volatile static u8 pin_state = 0;
 volatile static unsigned int gpioIRQs[NUM_ENCODERS] = {0};
 
 #endif //QUADRATURE
+#define NUM_PINS (QUADRATURE + 1)*NUM_ENCODERS
 
-static int cur_irq = -1;
-
-void wq_handle_irq(struct work_struct *work);
+static struct gpio_desc *gpios[NUM_PINS];
 
 static u8 isRunning = 0;
 
-static const char    g_s_Hello_World_string[] = "Hello world from kernel mode!\n\0";
-static const ssize_t g_s_Hello_World_size = sizeof(g_s_Hello_World_string);
-
+//counter for all interrupts for debugging, not really needed.
 volatile unsigned int interruptCount = 0;
 
-
-
-
 //interrupt handler.
-static irq_handler_t irq_handler(unsigned int irq, void *dev_id, struct pt_regs *regs){   
+static irqreturn_t irq_handler(int irq, void *dev_id){   
+
+   static int cur_irq = -1;
    interruptCount++;
 #if QUADRATURE
    if (isRunning){
@@ -91,8 +94,9 @@ static irq_handler_t irq_handler(unsigned int irq, void *dev_id, struct pt_regs 
 			break;
 		}
 	}
-	next_val = gpio_get_value(encoder_pins[cur_irq]);
-   	next_state = (pin_state & ~(0x01 << cur_irq)) | (next_val << cur_irq);
+
+	next_val = gpiod_get_value(gpios[cur_irq]);
+	next_state = (pin_state & ~(0x01 << cur_irq)) | (next_val << cur_irq);
 	encoder_id = cur_irq >> 1;
 	prevPins = pin_state;
 	nextPins = next_state;
@@ -116,6 +120,7 @@ static irq_handler_t irq_handler(unsigned int irq, void *dev_id, struct pt_regs 
 
 	encoder_counts[encoder_id] = encoder_counts[encoder_id] + stateChangeTable[prevPins][nextPins];
 	pin_state = next_state;
+
 #else //NOT QUADRATURE
    if (isRunning){
   	int i = 0;
@@ -129,7 +134,7 @@ static irq_handler_t irq_handler(unsigned int irq, void *dev_id, struct pt_regs 
 
 #endif //QUADRATURE
    }
-   return (irq_handler_t) IRQ_HANDLED;
+   return IRQ_HANDLED;
 }
 
 
@@ -155,9 +160,13 @@ static ssize_t device_file_read(
                         , loff_t *position)
 {
 
-   printk("Interrupt Count: %d\n",interruptCount);
-   copy_to_user(user_buffer,encoder_counts,sizeof(int)*NUM_ENCODERS);
-
+   printk(KERN_NOTICE "Interrupt Count: %d\n",interruptCount);
+   int not_copied = 0;
+   not_copied = copy_to_user(user_buffer,(const int*)encoder_counts,sizeof(int)*NUM_ENCODERS);
+   if (not_copied){
+      printk(KERN_WARNING "ENCODER - Copy to user failed");
+      return -EFAULT; // Return a bad address error
+   }
    return sizeof(int)*NUM_ENCODERS;
 }
 /*===============================================================================================*/
@@ -186,53 +195,61 @@ int register_device(void)
    }
 
    device_file_major_number = result;
-#if QUADRATURE
-   int i = 0;
-   for (i = 0; i < 2*NUM_ENCODERS; i++){
 
-	gpioIRQs[i] = gpio_to_irq(encoder_pins[i]);
-	gpio_request(encoder_pins[i],"encoder");
-	gpio_direction_input(encoder_pins[i]);
-	gpio_export(encoder_pins[i],false);
-	result = request_irq(gpioIRQs[i],(irq_handler_t) irq_handler,IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,"encoder_irq",NULL);
-   }
- 
-#else
    int i = 0;
-   for (i = 0; i < NUM_ENCODERS; i++){
+   int status = 0;
+   // Go through all the pins and register them, set them as inputs, and request interrupts on them.
+   // If this fails - you might have to restart because it won't clean up.
+   // but it also shouldn't fail.
+   for (i = 0; i < NUM_PINS; i++){
+      status = gpio_request(encoder_pins[i] + PIN_OFFSET, "encoder-gpio");
+      if(status){
+         printk(KERN_ERR "ENCODER - Error requesting gpio %d\n", encoder_pins[i]);
+         return status;
+      } 
+      gpios[i] = gpio_to_desc(encoder_pins[i] + PIN_OFFSET);
+      if (!gpios[i]){
+         printk(KERN_ERR "ENCODER - Error setting up gpio %d\n", encoder_pins[i]);
+         return -1;
+      }
+    
+      status = gpiod_direction_input(gpios[i]);
+      if (status){
+         printk(KERN_ERR "ENCODER - Error setting up direction of gpio %d\n", encoder_pins[i]);
+         return status;
+      }
+      
+      gpioIRQs[i] = gpiod_to_irq(gpios[i]);
+      if (gpioIRQs[i] < 0){
+         printk(KERN_ERR "ENCODER - Error finding IRQ for gpio %d\n", encoder_pins[i]);
+         return gpioIRQs[i];
+      }
 
-	gpioIRQs[i] = gpio_to_irq(encoder_pins[i]);
-	gpio_request(encoder_pins[i],"encoder");
-	gpio_direction_input(encoder_pins[i]);
-	gpio_export(encoder_pins[i],false);
-	result = request_irq(gpioIRQs[i],(irq_handler_t) irq_handler,IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,"encoder_irq",NULL);
+      status = request_irq(gpioIRQs[i], irq_handler, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, "encoder_irq", NULL);
+      if(status){
+         printk(KERN_ERR "ENCODER - Error requesting IRQ for gpio %d\n", encoder_pins[i]);
+         return status;
+      }
    }
-#endif
+
    isRunning = 1;
-
    return 0;
 }
 /*-----------------------------------------------------------------------------------------------*/
+// free all the irq and gpio resources.
 void unregister_device(void)
 {
    isRunning = 0;
-   printk( KERN_NOTICE, "encoder-driver: unregister_device() is called" );
+   printk( KERN_NOTICE "encoder-driver: unregister_device() is called" );
    int i = 0;
-#if QUADRATURE
-   for (i = 0; i < 2*NUM_ENCODERS; i++){
-	free_irq(gpioIRQs[i],NULL);
-	gpio_unexport(encoder_pins[i]);
-	gpio_free(encoder_pins[i]);
+
+
+   for (i = 0; i < NUM_PINS; i++){
+      free_irq(gpioIRQs[i],NULL);
+      gpiod_put(gpios[i]);
    }
-#else
-    for (i = 0; i < NUM_ENCODERS; i++){
-        free_irq(gpioIRQs[i],NULL);
-        gpio_unexport(encoder_pins[i]);
-        gpio_free(encoder_pins[i]);
-   }
-#endif
-   if(device_file_major_number != 0)
-   {
+   
+   if(device_file_major_number != 0){
       unregister_chrdev(device_file_major_number, device_name);
    }
 

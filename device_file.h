@@ -4,6 +4,6 @@
 
 __must_check int register_device(void); /* 0 if Ok*/
 
-void 			 unregister_device(void); 
+void unregister_device(void); 
 void kernel_probe(void);
 #endif //DEVICE_FILE_H_
